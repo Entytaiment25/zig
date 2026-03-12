@@ -1,10 +1,19 @@
 use std::{fs, path::Path};
-use zed_extension_api::{self as zed, serde_json, settings::LspSettings, LanguageServerId, Result};
+use zed_extension_api::{
+    self as zed,
+    http_client::{HttpMethod, HttpRequest, RedirectPolicy},
+    process::Command,
+    serde_json, settings::LspSettings, LanguageServerId, Result,
+};
 
 const ZIG_TEST_EXE_BASENAME: &str = "zig_test";
 
+/// The zigtools releases API endpoint for selecting a ZLS build that is
+/// compatible with a given Zig version.
+const ZLS_RELEASE_API: &str = "https://releases.zigtools.org/v1/zls/select-version";
+
 struct ZigExtension {
-    cached_binary_path: Option<String>,
+    cached_binary: Option<(String, String)>, // (zls_version, path)
 }
 
 #[derive(Clone)]
@@ -12,6 +21,78 @@ struct ZlsBinary {
     path: String,
     args: Option<Vec<String>>,
     environment: Option<Vec<(String, String)>>,
+}
+
+struct ZlsRelease {
+    version: String,
+    download_url: String,
+}
+
+/// Extracts the `minimum_zig_version` field from a `build.zig.zon` file.
+fn parse_minimum_zig_version(content: &str) -> Option<String> {
+    let key = ".minimum_zig_version";
+    let pos = content.find(key)?;
+    let after_key = &content[pos + key.len()..];
+    let after_eq = &after_key[after_key.find('=')? + 1..];
+    let after_quote = &after_eq[after_eq.find('"')? + 1..];
+    Some(after_quote[..after_quote.find('"')?].to_string())
+}
+
+/// Queries `releases.zigtools.org` for a ZLS build that matches `zig_version`.
+///
+/// Returns the ZLS version string and the download URL for the requested
+/// platform. On failure (e.g. the version isn't indexed yet, or no network),
+/// returns an `Err` so the caller can fall back to the latest stable release.
+fn query_zls_for_zig_version(zig_version: &str, arch: &str, os: &str) -> Result<ZlsRelease> {
+    // The `+` in Zig dev versions (e.g. `0.14.0-dev.123+abc`) must be
+    // percent-encoded so the query parameter is parsed correctly.
+    let encoded_version = zig_version.replace('+', "%2B");
+    let url = format!(
+        "{ZLS_RELEASE_API}?zig_version={encoded_version}&compatibility=only-runtime"
+    );
+
+    let response = HttpRequest::builder()
+        .method(HttpMethod::Get)
+        .url(&url)
+        .redirect_policy(RedirectPolicy::FollowAll)
+        .build()
+        .map_err(|e| format!("failed to build ZLS API request: {e}"))?
+        .fetch()
+        .map_err(|e| format!("failed to query ZLS release API: {e}"))?;
+
+    let body = String::from_utf8(response.body)
+        .map_err(|e| format!("invalid UTF-8 in ZLS API response: {e}"))?;
+
+    let json: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|e| format!("failed to parse ZLS API response: {e}"))?;
+
+    let version = json["version"]
+        .as_str()
+        .ok_or_else(|| {
+            format!("ZLS API returned no version for Zig {zig_version} (response: {body})")
+        })?
+        .to_string();
+
+    // Platforms are top-level keys in the response, e.g. "x86_64-macos".
+    // The API returns .tar.xz URLs, but zed's download_file only supports GzipTar (.tar.gz).
+    // Both formats are published, so we construct the .tar.gz URL from the version.
+    let platform_key = format!("{arch}-{os}");
+    // Verify the platform exists in the response before constructing the URL.
+    json[&platform_key]
+        .as_object()
+        .ok_or_else(|| {
+            format!("ZLS API response has no entry for platform '{platform_key}'")
+        })?;
+    let download_url = if os == "windows" {
+        format!("https://builds.zigtools.org/zls-{platform_key}-{version}.zip")
+    } else {
+        format!("https://builds.zigtools.org/zls-{platform_key}-{version}.tar.gz")
+    };
+
+    Ok(ZlsRelease {
+        version,
+        download_url,
+    })
 }
 
 impl ZigExtension {
@@ -49,56 +130,82 @@ impl ZigExtension {
             });
         }
 
-        if let Some(path) = &self.cached_binary_path {
-            if fs::metadata(path).is_ok_and(|stat| stat.is_file()) {
-                return Ok(ZlsBinary {
-                    path: path.clone(),
-                    args,
-                    environment,
-                });
-            }
-        }
-
         zed::set_language_server_installation_status(
             language_server_id,
             &zed::LanguageServerInstallationStatus::CheckingForUpdate,
         );
 
-        // Note that in github releases and on zlstools.org the tar.gz asset is not shown
-        // but is available at https://builds.zigtools.org/zls-{os}-{arch}-{version}.tar.gz
-        let release = zed::latest_github_release(
-            "zigtools/zls",
-            zed::GithubReleaseOptions {
-                require_assets: true,
-                pre_release: false,
-            },
-        )?;
-
-        let arch: &str = match arch {
+        let arch_str: &str = match arch {
             zed::Architecture::Aarch64 => "aarch64",
             zed::Architecture::X86 => "x86",
             zed::Architecture::X8664 => "x86_64",
         };
 
-        let os: &str = match platform {
+        let os_str: &str = match platform {
             zed::Os::Mac => "macos",
             zed::Os::Linux => "linux",
             zed::Os::Windows => "windows",
         };
 
-        let extension: &str = match platform {
-            zed::Os::Mac | zed::Os::Linux => "tar.gz",
-            zed::Os::Windows => "zip",
+        // Prefer a ZLS build that matches the project's minimum_zig_version.
+        // This is essential for master/nightly Zig where stable ZLS won't work.
+        let zig_version: String = match worktree
+            .read_text_file("build.zig.zon")
+            .ok()
+            .and_then(|zon| parse_minimum_zig_version(&zon))
+        {
+            Some(v) => v,
+            None => {
+                // No build.zig.zon or no minimum_zig_version field: fall back to
+                // running `zig version`. Use worktree.which() so we respect the
+                // user's PATH (important in WASM extension sandbox).
+                let zig_path = worktree
+                    .which("zig")
+                    .ok_or_else(|| {
+                        "`zig` not found on PATH and no `minimum_zig_version` in \
+                         build.zig.zon. Please ensure `zig` is on your PATH or add \
+                         `minimum_zig_version` to your build.zig.zon."
+                            .to_string()
+                    })?;
+                let output = Command::new(&zig_path)
+                    .arg("version")
+                    .output()
+                    .map_err(|e| format!("failed to run `{zig_path} version`: {e}"))?;
+                if output.status != Some(0) {
+                    let stderr = String::from_utf8_lossy(&output.stderr);
+                    return Err(format!(
+                        "`zig version` failed (exit {:?}): {stderr}",
+                        output.status
+                    ));
+                }
+                String::from_utf8(output.stdout)
+                    .map_err(|_| "`zig version` output was not valid UTF-8".to_string())?
+                    .trim()
+                    .to_string()
+            }
         };
 
-        let asset_name: String = format!("zls-{}-{}-{}.{}", arch, os, release.version, extension);
-        let download_url = format!("https://builds.zigtools.org/{}", asset_name);
+        let release = query_zls_for_zig_version(&zig_version, arch_str, os_str)?;
+        let (version, download_url) = (release.version, release.download_url);
 
-        let version_dir = format!("zls-{}", release.version);
+        let version_dir = format!("zls-{}", version);
         let binary_path = match platform {
             zed::Os::Mac | zed::Os::Linux => format!("{version_dir}/zls"),
             zed::Os::Windows => format!("{version_dir}/zls.exe"),
         };
+
+        // Return cached path if we already have this exact version on disk.
+        if let Some((ref cached_version, ref cached_path)) = self.cached_binary {
+            if cached_version == &version
+                && fs::metadata(cached_path).is_ok_and(|s| s.is_file())
+            {
+                return Ok(ZlsBinary {
+                    path: cached_path.clone(),
+                    args,
+                    environment,
+                });
+            }
+        }
 
         if !fs::metadata(&binary_path).is_ok_and(|stat| stat.is_file()) {
             zed::set_language_server_installation_status(
@@ -109,26 +216,27 @@ impl ZigExtension {
             zed::download_file(
                 &download_url,
                 &version_dir,
-                match platform {
-                    zed::Os::Mac | zed::Os::Linux => zed::DownloadedFileType::GzipTar,
-                    zed::Os::Windows => zed::DownloadedFileType::Zip,
+                if download_url.ends_with(".zip") {
+                    zed::DownloadedFileType::Zip
+                } else {
+                    zed::DownloadedFileType::GzipTar
                 },
             )
-            .map_err(|e| format!("failed to download file: {e}"))?;
+            .map_err(|e| format!("failed to download ZLS: {e}"))?;
 
             zed::make_file_executable(&binary_path)?;
 
             let entries =
-                fs::read_dir(".").map_err(|e| format!("failed to list working directory {e}"))?;
+                fs::read_dir(".").map_err(|e| format!("failed to list working directory: {e}"))?;
             for entry in entries {
-                let entry = entry.map_err(|e| format!("failed to load directory entry {e}"))?;
+                let entry = entry.map_err(|e| format!("failed to read directory entry: {e}"))?;
                 if entry.file_name().to_str() != Some(&version_dir) {
                     fs::remove_dir_all(entry.path()).ok();
                 }
             }
         }
 
-        self.cached_binary_path = Some(binary_path.clone());
+        self.cached_binary = Some((version, binary_path.clone()));
         Ok(ZlsBinary {
             path: binary_path,
             args,
@@ -140,7 +248,7 @@ impl ZigExtension {
 impl zed::Extension for ZigExtension {
     fn new() -> Self {
         Self {
-            cached_binary_path: None,
+            cached_binary: None,
         }
     }
 
